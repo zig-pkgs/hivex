@@ -118,6 +118,19 @@ pub const Hive = struct {
             };
         }
 
+        pub const GetChildError = posix.UnexpectedError;
+
+        pub fn getChild(self: *Node, name: [:0]const u8) GetChildError!?Node {
+            const child = c.hivex_node_get_child(self.hive, self.handle, name);
+            if (child == 0) {
+                switch (posix.errno(-1)) {
+                    .SUCCESS => return null,
+                    else => |err| return posix.unexpectedErrno(err),
+                }
+            }
+            return .{ .hive = self.hive, .handle = child };
+        }
+
         pub const GetValueError = posix.UnexpectedError;
 
         pub fn getValue(self: *Node, key: [:0]const u8) GetValueError!Value {
@@ -145,7 +158,8 @@ pub const Hive = struct {
                         .value = valueFn(self.hive, val),
                     });
                 },
-                else => return posix.unexpectedErrno(posix.E.INVAL),
+                // TODO: support all types of value
+                inline else => |tag| @panic("Unsupported type: " ++ @tagName(tag)),
             }
         }
 
@@ -280,6 +294,9 @@ test "just header" {
             .dword = .{ .key = "c", .value = 200000 },
         },
     });
+    const child_maybe = try root.getChild("This");
+    try testing.expect(child_maybe != null);
+    try testing.expectEqual(node.handle, (child_maybe.?.handle));
     const value_a = (try node.getValue("a")).string.value;
     const value_b = (try node.getValue("b")).string.value;
     const value_c = (try node.getValue("c")).dword.value;
