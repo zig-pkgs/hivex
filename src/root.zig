@@ -50,6 +50,55 @@ pub const Hive = struct {
             type: Type,
             value: []const u8,
         },
+
+        pub const ConvertError = error{
+            InvalidUtf8,
+        } || mem.Allocator.Error || std.fmt.ParseIntError;
+
+        pub fn convert(self: Value, gpa: mem.Allocator) ConvertError!c.hive_set_value {
+            var val: c.hive_set_value = undefined;
+            switch (self) {
+                .none => |v| {
+                    val.key = try gpa.dupeZ(u8, v.key);
+                    val.len = 0;
+                },
+                .hex => |v| {
+                    val.len = 0;
+                    val.t = @intFromEnum(v.type);
+                    const alloc_len = v.value.len / 3 + 1;
+                    val.key = try gpa.dupeZ(u8, v.key);
+                    val.value = try gpa.allocSentinel(u8, alloc_len, '\x00');
+                    var it = mem.tokenize(u8, v.value, ",");
+                    while (it.next()) |raw| {
+                        const hex = try std.fmt.parseInt(u8, raw, 16);
+                        val.value[val.len] = hex;
+                        val.len += 1;
+                    }
+                },
+                inline .string, .expand_string => |v, t| {
+                    val.key = try gpa.dupeZ(u8, v.key);
+                    const utf16 = try std.unicode.utf8ToUtf16LeAllocZ(gpa, v.value);
+                    const ptr: [*]u8 = @ptrCast(utf16.ptr);
+                    const slice = ptr[0 .. utf16.len * 2 + 1 :0];
+                    val.value = slice;
+                    val.len = slice.len + 1;
+                    val.t = @intFromEnum(@field(Type, @tagName(t)));
+                },
+                inline .dword, .qword => |v, t| {
+                    val.len = @sizeOf(@TypeOf(v.value));
+                    val.key = try gpa.dupeZ(u8, v.key);
+                    const n = blk: {
+                        switch (native_endian) {
+                            .little => break :blk v.value,
+                            .big => break :blk @byteSwap(v.value),
+                        }
+                    };
+                    val.value = try gpa.dupeZ(u8, mem.asBytes(&n));
+                    val.t = @intFromEnum(@field(Type, @tagName(t)));
+                },
+            }
+            return val;
+        }
     };
 
     pub const Node = struct {
@@ -100,55 +149,43 @@ pub const Hive = struct {
             }
         }
 
+        pub const SetValuesError = error{
+            InvalidUtf8,
+        } || posix.UnexpectedError || Value.ConvertError || mem.Allocator.Error;
+
+        pub fn setValues(self: *Node, values: []const Value) SetValuesError!void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const gpa = arena.allocator();
+            var vals_list = std.ArrayList(c.hive_set_value).init(gpa);
+            for (values) |v| {
+                try vals_list.append(try v.convert(gpa));
+            }
+            const zero = comptime mem.zeroes(c.hive_set_value);
+            const vals = try vals_list.toOwnedSliceSentinel(zero);
+            const rc = c.hivex_node_set_values(
+                self.hive,
+                self.handle,
+                vals.len,
+                vals.ptr,
+                0,
+            );
+            switch (posix.errno(rc)) {
+                .SUCCESS => return,
+                .NOMEM => return error.OutOfMemory,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        }
+
         pub const SetValueError = error{
             InvalidUtf8,
-        } || mem.Allocator.Error || posix.UnexpectedError || std.fmt.ParseIntError;
+        } || posix.UnexpectedError || Value.ConvertError;
 
         pub fn setValue(self: *Node, value: Value) SetValueError!void {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const gpa = arena.allocator();
-            var val: c.hive_set_value = undefined;
-            switch (value) {
-                .none => |v| {
-                    val.key = try gpa.dupeZ(u8, v.key);
-                    val.len = 0;
-                },
-                .hex => |v| {
-                    val.len = 0;
-                    val.t = @intFromEnum(v.type);
-                    const alloc_len = v.value.len / 3 + 1;
-                    val.key = try gpa.dupeZ(u8, v.key);
-                    val.value = try gpa.allocSentinel(u8, alloc_len, '\x00');
-                    var it = mem.tokenize(u8, v.value, ",");
-                    while (it.next()) |raw| {
-                        const hex = try std.fmt.parseInt(u8, raw, 16);
-                        val.value[val.len] = hex;
-                        val.len += 1;
-                    }
-                },
-                inline .string, .expand_string => |v, t| {
-                    val.key = try gpa.dupeZ(u8, v.key);
-                    const utf16 = try std.unicode.utf8ToUtf16LeAllocZ(gpa, v.value);
-                    const ptr: [*]u8 = @ptrCast(utf16.ptr);
-                    const slice = ptr[0 .. utf16.len * 2 + 1 :0];
-                    val.value = slice;
-                    val.len = slice.len + 1;
-                    val.t = @intFromEnum(@field(Type, @tagName(t)));
-                },
-                inline .dword, .qword => |v, t| {
-                    val.len = @sizeOf(@TypeOf(v.value));
-                    val.key = try gpa.dupeZ(u8, v.key);
-                    const n = blk: {
-                        switch (native_endian) {
-                            .little => break :blk v.value,
-                            .big => break :blk @byteSwap(v.value),
-                        }
-                    };
-                    val.value = try gpa.dupeZ(u8, mem.asBytes(&n));
-                    val.t = @intFromEnum(@field(Type, @tagName(t)));
-                },
-            }
+            var val = try value.convert(gpa);
             const rc = c.hivex_node_set_value(self.hive, self.handle, &val, 0);
             switch (posix.errno(rc)) {
                 .SUCCESS => return,
@@ -167,7 +204,7 @@ pub const Hive = struct {
     };
 
     pub const OpenError = error{
-        NoMemory,
+        OutOfMemory,
     } || posix.OpenError || posix.UnexpectedError;
 
     pub fn open(path: [:0]const u8, flags: OpenFlags) OpenError!Hive {
@@ -175,6 +212,7 @@ pub const Hive = struct {
             .handle = c.hivex_open(path, @bitCast(flags)) orelse {
                 switch (posix.errno(-1)) {
                     .SUCCESS => unreachable,
+                    .NOMEM => return error.OutOfMemory,
                     else => |err| return posix.unexpectedErrno(err),
                 }
             },
@@ -227,18 +265,20 @@ test "just header" {
     var root = h.root();
     try testing.expectEqualStrings("$$$PROTO.HIV", root.getName());
     var node = root.addChild("This");
-    try node.setValue(.{
-        .string = .{ .key = "a", .value = "ABCD" },
-    });
-    try node.setValue(.{
-        .hex = .{
-            .key = "b",
-            .type = .string,
-            .value = "41,00,42,00,43,00,44,00,00,00",
+    try node.setValues(&.{
+        .{
+            .string = .{ .key = "a", .value = "ABCD" },
         },
-    });
-    try node.setValue(.{
-        .dword = .{ .key = "c", .value = 200000 },
+        .{
+            .hex = .{
+                .key = "b",
+                .type = .string,
+                .value = "41,00,42,00,43,00,44,00,00,00",
+            },
+        },
+        .{
+            .dword = .{ .key = "c", .value = 200000 },
+        },
     });
     const value_a = (try node.getValue("a")).string.value;
     const value_b = (try node.getValue("b")).string.value;
