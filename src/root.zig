@@ -46,6 +46,7 @@ pub const Hive = struct {
             value: []const u8,
         },
         hex: struct {
+            handle: c.hive_value_h = 0,
             key: []const u8,
             type: Type,
             value: []const u8,
@@ -233,6 +234,15 @@ pub const Hive = struct {
                 }
             },
         };
+    }
+
+    pub const NodeLookupError = Node.GetChildError;
+
+    pub fn nodeLookup(self: *Hive, path: []const u8) NodeLookupError!Node {
+        var it = mem.tokenizeAny(u8, path, "\\");
+        var node = self.root();
+        while (it.next()) |name| node = try node.getChild(name);
+        return node;
     }
 
     pub fn close(self: *Hive) void {
