@@ -118,13 +118,15 @@ pub const Hive = struct {
             };
         }
 
-        pub const GetChildError = posix.UnexpectedError;
+        pub const GetChildError = error{
+            ChildNotFound,
+        } || posix.UnexpectedError;
 
-        pub fn getChild(self: *Node, name: [:0]const u8) GetChildError!?Node {
+        pub fn getChild(self: *Node, name: [:0]const u8) GetChildError!Node {
             const child = c.hivex_node_get_child(self.hive, self.handle, name);
             if (child == 0) {
                 switch (posix.errno(-1)) {
-                    .SUCCESS => return null,
+                    .SUCCESS => return error.ChildNotFound,
                     else => |err| return posix.unexpectedErrno(err),
                 }
             }
@@ -294,9 +296,8 @@ test "just header" {
             .dword = .{ .key = "c", .value = 200000 },
         },
     });
-    const child_maybe = try root.getChild("This");
-    try testing.expect(child_maybe != null);
-    try testing.expectEqual(node.handle, (child_maybe.?.handle));
+    const child = try root.getChild("This");
+    try testing.expectEqual(node.handle, (child.handle));
     const value_a = (try node.getValue("a")).string.value;
     const value_b = (try node.getValue("b")).string.value;
     const value_c = (try node.getValue("c")).dword.value;

@@ -80,6 +80,13 @@ pub fn build(b: *std.Build) void {
     lib.installHeader(b.path("upstream/include/hivex.h"), "hivex.h");
     b.installArtifact(lib);
 
+    const mod = b.addModule("hivex", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.linkLibrary(lib);
+
     const lib_unit_tests = b.addTest(.{
         .root_source_file = .{ .path = "src/root.zig" },
         .target = target,
